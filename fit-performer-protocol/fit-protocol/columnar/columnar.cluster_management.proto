@@ -47,9 +47,19 @@ message ClusterNewInstanceRequest {
       string jwt = 1;
     }
 
+    // Authenticates using a client certificate (mTLS).
+    // The SDK authenticates the client during the TLS handshake.
+    message CertificateAuth {
+      // PEM-encoded X509 client certificate
+      string cert = 1;
+      // PEM-encoded private key
+      string key = 2;
+    }
+
     oneof type {
       UsernameAndPassword username_and_password = 1;
       JwtAuth jwt_auth = 2;
+      CertificateAuth certificate_auth = 3;
     }
   }
 
@@ -91,7 +101,7 @@ message CloseAllColumnarClustersRequest {
 
 // Requests the performer to update the credential on an existing cluster connection.
 // Per the EA RFC, `cluster.credential(newCredential)` replaces the credential used for subsequent requests.
-// The new credential must be the same type as the old one (e.g. JWT -> JWT).
+// The new credential must be the same type as the old one (e.g. JWT -> JWT, cert -> cert).
 message SetCredentialRequest {
   ExecutionContextClusterLevel execution_context = 1;
   ClusterNewInstanceRequest.Credential credential = 2;

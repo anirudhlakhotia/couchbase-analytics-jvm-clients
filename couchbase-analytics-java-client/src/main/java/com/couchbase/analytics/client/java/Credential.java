@@ -22,36 +22,41 @@ import okhttp3.tls.HandshakeCertificates;
 import okhttp3.tls.HeldCertificate;
 import org.jspecify.annotations.Nullable;
 
+import java.io.ByteArrayInputStream;
+import java.io.IOException;
 import java.io.InputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.security.GeneralSecurityException;
+import java.security.KeyFactory;
 import java.security.KeyPair;
 import java.security.KeyStore;
 import java.security.PrivateKey;
 import java.security.cert.Certificate;
+import java.security.cert.CertificateFactory;
 import java.security.cert.X509Certificate;
+import java.security.spec.PKCS8EncodedKeySpec;
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Base64;
+import java.util.Collections;
 import java.util.Enumeration;
 import java.util.List;
-import java.util.function.Supplier;
 
 import static com.couchbase.analytics.client.java.internal.utils.lang.CbCollections.listCopyOf;
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static java.util.Objects.requireNonNull;
 
 /**
- * Create an instance like this:
+ * Create an instance with one of the static factory methods:
  * <pre>
  * Credential.of(username, password)
+ * Credential.ofJwt(jwt)
+ * Credential.fromKeyStore(Paths.get("/path/to/client-cert.p12"), "password")
+ * Credential.fromPem(Paths.get("/path/to/client-cert.pem"))
  * </pre>
- * Alternatively, to use a client certificate:
- * <pre>
- * Credential.fromKeyStore(
- *     Paths.get("/path/to/client-cert.p12"),
- *     "password"
- * )
- * </pre>
+ * The credential can later be rotated by calling {@link Cluster#credential(Credential)}
+ * (typical for short-lived JWTs).
  *
  * @see Cluster#credential(Credential)
  */
@@ -69,10 +74,6 @@ public abstract class Credential {
     String httpAuthorizationHeaderValue() {
       return authHeaderValue;
     }
-
-    @Override
-    void addHeldCertificate(HandshakeCertificates.Builder builder) {
-    }
   }
 
   private static class Jwt extends Credential {
@@ -86,17 +87,13 @@ public abstract class Credential {
     String httpAuthorizationHeaderValue() {
       return authHeaderValue;
     }
-
-    @Override
-    void addHeldCertificate(HandshakeCertificates.Builder builder) {
-    }
   }
 
   private static class ClientCertificate extends Credential {
     private final HeldCertificate heldCertificate;
     private final List<X509Certificate> intermediates;
 
-    public ClientCertificate(HeldCertificate heldCertificate, List<X509Certificate> intermediates) {
+    ClientCertificate(HeldCertificate heldCertificate, List<X509Certificate> intermediates) {
       this.heldCertificate = requireNonNull(heldCertificate);
       this.intermediates = listCopyOf(intermediates);
     }
@@ -110,23 +107,15 @@ public abstract class Credential {
     void addHeldCertificate(HandshakeCertificates.Builder builder) {
       builder.heldCertificate(heldCertificate, intermediates.toArray(new X509Certificate[0]));
     }
-  }
 
-  private static class Dynamic extends Credential {
-    private final Supplier<Credential> supplier;
-
-    public Dynamic(Supplier<Credential> supplier) {
-      this.supplier = requireNonNull(supplier);
+    @Override
+    @Nullable X509Certificate leafCertificate() {
+      return heldCertificate.certificate();
     }
 
     @Override
-    @Nullable String httpAuthorizationHeaderValue() {
-      return supplier.get().httpAuthorizationHeaderValue();
-    }
-
-    @Override
-    void addHeldCertificate(HandshakeCertificates.Builder builder) {
-      supplier.get().addHeldCertificate(builder);
+    List<X509Certificate> intermediates() {
+      return intermediates;
     }
   }
 
@@ -139,12 +128,13 @@ public abstract class Credential {
 
   /**
    * Returns a new instance that holds the given JSON Web Token (JWT).
+   * Because JWTs typically expire within minutes, callers are expected to
+   * rotate by passing a fresh credential to {@link Cluster#credential(Credential)}
+   * before the token expires.
    * <p>
    * Requires Enterprise Analytics 2.2 or later.
-   * <p>
-   * <b>NOTE:</b> This kind of credential often has a relatively short validity period.
-   * To prevent authentication failures caused by stale credentials,
-   * periodically pass a fresh credential to {@link Cluster#credential(Credential)}.
+   *
+   * @see Cluster#credential(Credential)
    */
   public static Credential ofJwt(String jwt) {
     return new Jwt(jwt);
@@ -168,17 +158,6 @@ public abstract class Credential {
    */
   public static Credential fromKeyStore(Path pkcs12Path, @Nullable String password) {
     KeyStore keyStore = loadKeyStore(pkcs12Path, password);
-    return fromKeyStore(keyStore, password);
-  }
-
-  /**
-   * Returns a new instance that holds a client certificate loaded from the specified key store.
-   * <p>
-   * The key store must have a single entry which must contain a private key and certificate chain.
-   *
-   * @param password for decrypting the private key
-   */
-  public static Credential fromKeyStore(KeyStore keyStore, @Nullable String password) {
     try {
       List<String> aliases = toList(keyStore.aliases());
       if (aliases.size() != 1) {
@@ -207,6 +186,173 @@ public abstract class Credential {
     }
   }
 
+  /**
+   * Returns a new instance that holds a client certificate built from a PEM file
+   * containing the leaf X.509 certificate (first), its matching PKCS#8 private key,
+   * and any intermediate certificates (after the leaf, in order from leaf to root).
+   * <p>
+   * For PKCS#1 (legacy {@code -----BEGIN RSA PRIVATE KEY-----}) keys, convert with:
+   * <pre>
+   * openssl pkcs8 -topk8 -in old.key -out new.key -nocrypt
+   * </pre>
+   */
+  public static Credential fromPem(Path pemPath) {
+    requireNonNull(pemPath, "pemPath");
+    try {
+      return fromPem(new String(Files.readAllBytes(pemPath), UTF_8));
+    } catch (IOException e) {
+      throw new RuntimeException("Failed to read PEM file: " + pemPath, e);
+    }
+  }
+
+  /**
+   * Returns a new instance that holds a client certificate built from a PEM-encoded
+   * string containing the leaf X.509 certificate (first), its matching RSA private key,
+   * and any intermediate certificates (after the leaf, in order from leaf to root).
+   * <p>
+   * The private key may be in either PKCS#8 ({@code -----BEGIN PRIVATE KEY-----})
+   * or PKCS#1 ({@code -----BEGIN RSA PRIVATE KEY-----}) form.
+   */
+  public static Credential fromPem(String pem) {
+    requireNonNull(pem, "pem");
+
+    List<String> certBlocks = pemBlocks(pem, "CERTIFICATE");
+    if (certBlocks.isEmpty()) {
+      throw new IllegalArgumentException("PEM contains no CERTIFICATE block.");
+    }
+
+    PrivateKey privateKey = privateKeyFromPem(pem);
+
+    try {
+      CertificateFactory factory = CertificateFactory.getInstance("X.509");
+      X509Certificate leaf = (X509Certificate) factory.generateCertificate(
+        new ByteArrayInputStream(certBlocks.get(0).getBytes(UTF_8))
+      );
+
+      // Best-effort sanity check: getBasicConstraints() returns >= 0 only when the BasicConstraints
+      // extension is present and marks the cert as a CA. A CA in the leaf position is almost always
+      // user error (chain in wrong order). This won't catch a v1 / no-extension CA in leaf position.
+      if (leaf.getBasicConstraints() != -1) {
+        throw new IllegalArgumentException(
+          "PEM does not begin with a leaf (end-entity) certificate. " +
+            "The leaf must come first, followed by intermediates in leaf-to-root order."
+        );
+      }
+
+      HeldCertificate held = new HeldCertificate(new KeyPair(leaf.getPublicKey(), privateKey), leaf);
+
+      List<X509Certificate> intermediates = new ArrayList<>();
+      byte[] leafEncoded = leaf.getEncoded();
+      for (int i = 1; i < certBlocks.size(); i++) {
+        X509Certificate cert = (X509Certificate) factory.generateCertificate(
+          new ByteArrayInputStream(certBlocks.get(i).getBytes(UTF_8))
+        );
+        if (Arrays.equals(cert.getEncoded(), leafEncoded)) {
+          throw new IllegalArgumentException(
+            "PEM contains the leaf certificate more than once. The leaf must appear exactly once, " +
+              "followed by intermediates in leaf-to-root order."
+          );
+        }
+        intermediates.add(cert);
+      }
+      return new ClientCertificate(held, intermediates);
+    } catch (GeneralSecurityException e) {
+      throw new RuntimeException("Failed to build client certificate from PEM.", e);
+    }
+  }
+
+  private static PrivateKey privateKeyFromPem(String pem) {
+    boolean hasPkcs8 = pem.contains("-----BEGIN PRIVATE KEY-----");
+    boolean hasPkcs1 = pem.contains("-----BEGIN RSA PRIVATE KEY-----");
+    if (hasPkcs8 == hasPkcs1) {
+      // both true (ambiguous) or both false (none)
+      throw new IllegalArgumentException("PEM must contain exactly one PRIVATE KEY or RSA PRIVATE KEY block.");
+    }
+    try {
+      if (hasPkcs8) {
+        return KeyFactory.getInstance("RSA").generatePrivate(
+          new PKCS8EncodedKeySpec(pemBlock(pem, "PRIVATE KEY"))
+        );
+      }
+      return rsaPrivateKeyFromPkcs1(pemBlock(pem, "RSA PRIVATE KEY"));
+    } catch (GeneralSecurityException e) {
+      throw new RuntimeException("Failed to parse private key from PEM.", e);
+    }
+  }
+
+  // Extracts every PEM block of the given type (e.g. "CERTIFICATE"), in input order.
+  // Used for certificates because a PEM may contain leaf + intermediates.
+  private static List<String> pemBlocks(String pem, String type) {
+    String begin = "-----BEGIN " + type + "-----";
+    String end = "-----END " + type + "-----";
+    List<String> blocks = new ArrayList<>();
+    int searchFrom = 0;
+    while (true) {
+      int start = pem.indexOf(begin, searchFrom);
+      if (start < 0) break;
+      int stop = pem.indexOf(end, start);
+      if (stop < 0) break;
+      stop += end.length();
+      blocks.add(pem.substring(start, stop));
+      searchFrom = stop;
+    }
+    return blocks;
+  }
+
+  // Extracts the base64-decoded body of the first PEM block of the given type.
+  private static byte[] pemBlock(String pem, String type) {
+    String header = "-----BEGIN " + type + "-----";
+    String footer = "-----END " + type + "-----";
+    int start = pem.indexOf(header);
+    int end = pem.indexOf(footer);
+    if (start < 0 || end < 0) {
+      throw new IllegalArgumentException("PEM does not contain block: " + type);
+    }
+    String body = pem.substring(start + header.length(), end).replaceAll("\\s", "");
+    return Base64.getDecoder().decode(body);
+  }
+
+  // Wraps a PKCS#1 RSA private key in a PKCS#8 PrivateKeyInfo so the JDK KeyFactory can load it,
+  // avoiding a Bouncy Castle dependency.
+  private static PrivateKey rsaPrivateKeyFromPkcs1(byte[] pkcs1) throws GeneralSecurityException {
+    byte[] algorithmId = {
+      0x30, 0x0d, 0x06, 0x09, 0x2a, (byte) 0x86, 0x48, (byte) 0x86,
+      (byte) 0xf7, 0x0d, 0x01, 0x01, 0x01, 0x05, 0x00
+    };
+    byte[] version = {0x02, 0x01, 0x00};
+    byte[] octetString = derTlv(0x04, pkcs1);
+    byte[] inner = concat(version, algorithmId, octetString);
+    byte[] pkcs8 = derTlv(0x30, inner);
+    return KeyFactory.getInstance("RSA").generatePrivate(new PKCS8EncodedKeySpec(pkcs8));
+  }
+
+  private static byte[] derTlv(int tag, byte[] value) {
+    byte[] length = derLength(value.length);
+    byte[] result = new byte[1 + length.length + value.length];
+    result[0] = (byte) tag;
+    System.arraycopy(length, 0, result, 1, length.length);
+    System.arraycopy(value, 0, result, 1 + length.length, value.length);
+    return result;
+  }
+
+  private static byte[] derLength(int len) {
+    if (len < 0x80) return new byte[]{(byte) len};
+    if (len < 0x100) return new byte[]{(byte) 0x81, (byte) len};
+    return new byte[]{(byte) 0x82, (byte) (len >> 8), (byte) (len & 0xff)};
+  }
+
+  private static byte[] concat(byte[]... arrays) {
+    int total = 0;
+    for (byte[] a : arrays) total += a.length;
+    byte[] result = new byte[total];
+    int pos = 0;
+    for (byte[] a : arrays) {
+      System.arraycopy(a, 0, result, pos, a.length);
+      pos += a.length;
+    }
+    return result;
+  }
+
   private static KeyStore loadKeyStore(Path keyStorePath, @Nullable String password) {
     try (InputStream keyStoreInputStream = Files.newInputStream(keyStorePath)) {
       final KeyStore store = KeyStore.getInstance(KeyStore.getDefaultType());
@@ -228,26 +374,30 @@ public abstract class Credential {
     return result;
   }
 
-  /**
-   * Returns a new instance of a dynamic credential that invokes the given supplier
-   * every time a credential is required.
-   * <p>
-   * This enables updating a credential without having to restart your application.
-   *
-   * @deprecated This method is not compatible with client certificate credentials.
-   * Instead, please update the credential by calling {@link Cluster#credential(Credential)}.
-   */
-  @Deprecated
-  public static Credential ofDynamic(Supplier<Credential> supplier) {
-    return new Dynamic(supplier);
-  }
-
   abstract @Nullable String httpAuthorizationHeaderValue();
 
-  abstract void addHeldCertificate(HandshakeCertificates.Builder builder);
+  /**
+   * Hook for client-certificate credentials to attach themselves to the OkHttp
+   * {@link HandshakeCertificates.Builder} that backs the SSL context. The default
+   * is a no-op so non-cert credentials don't have to override.
+   */
+  void addHeldCertificate(HandshakeCertificates.Builder builder) {
+  }
+
+  /** Returns the leaf X.509 certificate for client-certificate credentials, or {@code null}. */
+  @Nullable X509Certificate leafCertificate() {
+    return null;
+  }
+
+  /** Returns intermediate X.509 certificates for client-certificate credentials, or empty. */
+  List<X509Certificate> intermediates() {
+    return Collections.emptyList();
+  }
 
   /**
    * @see #of
+   * @see #ofJwt
+   * @see #fromPem
    * @see #fromKeyStore
    */
   private Credential() {

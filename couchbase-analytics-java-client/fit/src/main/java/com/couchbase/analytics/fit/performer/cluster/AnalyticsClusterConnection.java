@@ -105,6 +105,9 @@ public class AnalyticsClusterConnection {
         proto.getUsernameAndPassword().getPassword()
       );
       case JWT_AUTH -> Credential.ofJwt(proto.getJwtAuth().getJwt());
+      case CERTIFICATE_AUTH -> Credential.fromPem(
+        proto.getCertificateAuth().getCert() + "\n" + proto.getCertificateAuth().getKey()
+      );
       case TYPE_NOT_SET -> throw new IllegalArgumentException("FIT request did not specify a credential.");
     };
   }
